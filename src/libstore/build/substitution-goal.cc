@@ -5,10 +5,35 @@
 #include "nix/util/finally.hh"
 #include "nix/util/signals.hh"
 #include "nix/store/globals.hh"
+#include "nix/store/filetransfer.hh"
 
 #include <coroutine>
+#include <regex>
 
 namespace nix {
+
+/**
+ * Check if an error is a timeout or network error that should trigger
+ * automatic fallback to the next substituter, regardless of tryFallback setting.
+ */
+static bool isTimeoutOrNetworkError(const Error & e) {
+    // Use proper error classification for FileTransferError
+    if (auto ftError = dynamic_cast<const FileTransferError*>(&e)) {
+        switch (ftError->error) {
+            case FileTransfer::Error::Transient:
+                return true;
+            case FileTransfer::Error::NotFound:
+            case FileTransfer::Error::Forbidden: 
+            case FileTransfer::Error::Misc:
+            case FileTransfer::Error::Interrupted:
+                return false;
+        }
+    }
+    
+    // For non-FileTransferError cases, assume they are not network errors
+    // that should trigger automatic fallback
+    return false;
+}
 
 PathSubstitutionGoal::PathSubstitutionGoal(
     const StorePath & storePath, Worker & worker, RepairFlag repair, std::optional<ContentAddress> ca)
@@ -55,6 +80,8 @@ Goal::Co PathSubstitutionGoal::init()
     auto subs = settings.useSubstitutes ? getDefaultSubstituters() : std::list<ref<Store>>();
 
     bool substituterFailed = false;
+    bool anyTimeoutOrNetworkError = false;
+    size_t substitutionAttempts = 0;
 
     for (const auto & sub : subs) {
         trace("trying next substituter");
@@ -79,7 +106,8 @@ Goal::Co PathSubstitutionGoal::init()
 
         try {
             // FIXME: make async
-            info = sub->queryPathInfo(subPath ? *subPath : storePath);
+            info = 
+                sub->queryPathInfo(subPath ? *subPath : storePath);
         } catch (InvalidPath &) {
             continue;
         } catch (SubstituterDisabled & e) {
@@ -88,7 +116,15 @@ Goal::Co PathSubstitutionGoal::init()
             else
                 throw e;
         } catch (Error & e) {
-            if (settings.tryFallback) {
+            substitutionAttempts++;
+            bool isTimeoutError = isTimeoutOrNetworkError(e);
+            anyTimeoutOrNetworkError = anyTimeoutOrNetworkError || isTimeoutError;
+            
+            // Always try fallback for timeout/network errors, regardless of tryFallback setting
+            if (isTimeoutError || settings.tryFallback) {
+                warn("substituter '%s' failed with %s, trying next substituter",
+                     sub->config.getHumanReadableURI(), 
+                     isTimeoutError ? "timeout/network error" : "error");
                 logError(e.info());
                 continue;
             } else
@@ -157,14 +193,28 @@ Goal::Co PathSubstitutionGoal::init()
         worker.updateProgress();
     }
 
-    /* Hack: don't indicate failure if there were no substituters.
-       In that case the calling derivation should just do a
-       build. */
+    /* Improved handling: if we only had timeout/network errors and no real failures,
+       treat it as "no substituters" to allow fallback to building from source.
+       This prevents timeout errors from being treated as permanent failures. */
+    bool shouldAllowBuild = !substituterFailed || 
+                           (anyTimeoutOrNetworkError && substitutionAttempts > 0);
+
+    std::string errorMsg;
+    if (substitutionAttempts == 0) {
+        errorMsg = fmt("path '%s' is required, but there is no substituter that can build it",
+                      worker.store.printStorePath(storePath));
+    } else if (anyTimeoutOrNetworkError) {
+        errorMsg = fmt("path '%s' could not be substituted due to network issues with all substituters",
+                      worker.store.printStorePath(storePath));
+    } else {
+        errorMsg = fmt("path '%s' is required, but substitution failed",
+                      worker.store.printStorePath(storePath));
+    }
+
     co_return done(
-        substituterFailed ? ecFailed : ecNoSubstituters,
+        shouldAllowBuild ? ecNoSubstituters : ecFailed,
         BuildResult::NoSubstituters,
-        fmt("path '%s' is required, but there is no substituter that can build it",
-            worker.store.printStorePath(storePath)));
+        errorMsg);
 }
 
 Goal::Co PathSubstitutionGoal::tryToRun(
